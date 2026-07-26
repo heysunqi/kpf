@@ -1,0 +1,10 @@
+/bin/
+*.log
+*.test
+*.out
+coverage.out
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
