@@ -51,6 +51,7 @@
 - **孤儿 listener**（端口在监听但 state 里没有对应记录）：很可能是上一次关闭时未释放的 socket —— WARN 日志带原因与提示。
 - **missing listener**（state 里有记录但内核没有对应监听）：通常是 restore 时 dial 失败 —— WARN 日志明确告知用户哪些 forward 没起来。
 - **零外部依赖**：早期版本用 `lsof` 拿进程监听列表；现在直接读 `pf.GetPorts()`，不再依赖任何 shell 工具，在最小 Linux 容器、Alpine、macOS、Windows 都跑得起来。
+- **`kpf doctor` CLI 入口**：把同样的对齐检查 + ping + state 健康度 + stale 计数暴露给 shell 脚本 / CI（退出码 0/1/2）。
 
 ### 交互体验
 
@@ -182,6 +183,7 @@ go install ./cmd/kpf@latest
 ```sh
 ./bin/kpf daemon start                        # 后台 daemon
 ./bin/kpf ping                                # 验证 daemon 在线
+./bin/kpf doctor                              # 健康检查（端口对齐 / state 健康）
 ./bin/kpf namespaces ~/.kube/config          # 调试：列出命名空间
 ./bin/kpf forward start \
     --kubeconfig ~/.kube/config \
@@ -189,7 +191,11 @@ go install ./cmd/kpf@latest
     --kind Deployment \
     --object my-app \
     --ports 8080:8080,9090:9090
-./bin/kpf ls                                  # 表格化列出活跃 forward
+./bin/kpf ls --json | jq '.[].id'             # 表格化列出活跃 forward（JSON 给脚本）
+./bin/kpf ls --watch                          # watch 模式：状态变化时清屏重打
+./bin/kpf logs fwd_0001                       # 看日志（默认采样 500ms）
+./bin/kpf logs -f fwd_0001                    # follow 模式
+./bin/kpf restart fwd_0001                    # 用同一 spec 重启（保留 ID）
 ./bin/kpf stop fwd_0001                       # 停止单条
 ./bin/kpf daemon stop                         # 全部停掉
 ```
@@ -210,15 +216,18 @@ kpf forward start ...     # 启动一条 forward
 kpf forward list          # 同 `kpf ls`
 kpf forward stop ID       # 同 `kpf stop ID`
 kpf forward stopAll       # 同 `kpf stop --all`
+kpf forward restart ID    # 同 `kpf restart ID`（用同一 spec 重启）
 kpf forward events [-f] ID [ID...]    # 流式打印 forward 事件（-f 跟随直到 stdin 关闭）
 
-kpf ls / kpf list          # 表格化列出活跃 forward
+kpf ls / kpf list          # 表格化列出活跃 forward（支持 --json / --watch / 过滤）
 kpf stop ID                 # 停一条
 kpf stop --all              # 停全部
-kpf logs <id>               # 流式打印 forward 日志（当前转发到 `forward events`）
+kpf restart ID              # 用同一 spec 重启一条（保留 ID）
+kpf logs [-f] <id>          # 流式打印 forward 日志
 kpf ns / kpf namespaces PATH  # 列命名空间（两个别名等价）
 
 kpf ping                  # 探活 daemon
+kpf doctor                # 健康检查（daemon / socket / state / listener parity）
 kpf namespaces PATH       # 列 kubeconfig 的 namespaces
 kpf version               # 版本
 kpf help                  # 完整帮助
@@ -236,6 +245,49 @@ kpf help                  # 完整帮助
 | `--bind`        |      | `0.0.0.0`  | 本地绑定地址                               |
 | `--ports`       | ✅   |            | `local:remote[,local:remote…]`             |
 | `--pod`         |      | 自动解析   | 覆盖 pod 名（极少用到）                    |
+
+### `kpf ls` flags
+
+| 标志        | 说明                                                |
+| ----------- | --------------------------------------------------- |
+| `--json`    | 输出 JSON 数组（适合 `jq` / CI 消费）               |
+| `--watch`   | watch 模式：每次 forward 状态变化时清屏重打          |
+| `-w`        | 同 `--watch`                                        |
+| `--ns`      | 按 namespace 过滤（精确匹配）                       |
+| `--kind`    | 按资源类型过滤（`Pod`/`Service`/…，大小写不敏感）   |
+| `--status`  | 按状态过滤（`ready`/`dropped`/`stale`/…，大小写不敏感）|
+
+watch 模式下默认清屏 + 光标归位；JSON 模式下不刷屏，每行一个快照 JSON。Log 事件不会触发 watch 刷新（频次太高），只刷新 ready/dropped/stopped/stale/error。
+
+### `kpf logs` flags
+
+| 标志      | 说明                                              |
+| --------- | ------------------------------------------------- |
+| `-f`      | follow 模式：阻塞到 stdin 关闭                    |
+| `--follow`| 同 `-f`                                           |
+
+默认行为是采样 500ms 后退出，输出 `<ts>\t<stream>\t<line>`。
+
+### `kpf doctor`
+
+`kpf doctor` 跑一组健康检查并以退出码反映最差结果：
+
+| 退出码 | 含义                                       |
+| ------ | ------------------------------------------ |
+| 0      | 全部 PASS                                  |
+| 1      | 至少一个 WARN，没有 FAIL                   |
+| 2      | 至少一个 FAIL                              |
+
+输出格式：`[LEVEL] check-name: detail`，按以下顺序：
+
+1. **daemon-reachable** — socket 能否 dial 到
+2. **daemon-ping** — ping 返回 version + uptime
+3. **state-list** — `forward.list` 能成功返回
+4. **listener-parity** — `pf.GetPorts()` 实际监听端口 vs spec 声明端口的对称差（orphan = 监听但无 spec；missing = spec 但未监听）
+5. **stale-forwards** — `status=stale` 的 forward 数量
+6. **status-vocabulary** — 所有 forward 的 status 是否在已知集合内
+
+`listener-parity` 这条把 daemon 内部的 `computeParity` 审计暴露给 CLI — 配合 TUI 的 `===[ 守护进程审计 ]` 一节，是排查"端口被别的进程占了"或"forward 注册成功但没起来"的第一站。
 
 ---
 
@@ -354,6 +406,15 @@ daemon 大概率挂了。`kpf daemon status` 确认；`kpf daemon start` 重启�
 
 **Audit 警告 `orphan LISTEN ports`**
 daemon 启动 5s 后会做一次 listener 审计。如果日志报 `orphan LISTEN ports [9999, 27017]`，说明 kernel 上有 kpf 持有的监听端口但 `state.json` 里没有对应记录 —— 通常是上一次 Stop 时 socket 未释放。daemon 重启会自动清理（每次启动都重读 state.json）；若想立即清理，`pkill -9 __daemon__` 后重启即可。
+
+**快速排查一切**
+跑 `kpf doctor`。它会用退出码（0 / 1 / 2）告诉你 daemon / socket / state / 端口对齐哪里坏了，详情看 `### kpf doctor`。配合 TUI 的 audit 章节，可以不用翻 daemon log 就定位大部分问题。
+
+**`kpf logs <id>` 没有任何输出**
+log 事件要等 forward 真有 `stdout/stderr` 流量才会产生。新建的 forward 静默期是正常的。`-f` 进 follow 模式后保持 stdout 开，等待一段时间。
+
+**`kpf restart <id>` 返回 `not_found: ... not found in history`**
+daemon 只在内存里保留 spec，**重启 daemon 后会丢**。`state.json` 也没有存（设计如此，避免历史污染）。解决办法：用 `kpf forward start ...` 重起一条，记得保留原 ID 的稳定语义就靠 `--pod` + `--bind` 一致。
 
 ---
 

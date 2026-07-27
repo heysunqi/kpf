@@ -240,14 +240,28 @@ func TestApp_EnterBlockedAtStepPortWhileStarting(t *testing.T) {
 // scoped: a normal Enter at step ⑤ when no forward is in flight still
 // emits PortMapReadyMsg (the regular submit path).
 func TestApp_EnterPassesAtStepPortWhenNotStarting(t *testing.T) {
+	// Pick a free port dynamically so the test isn't sensitive to what's
+	// listening on the test host. Bind to 127.0.0.1 (the loopback) instead
+	// of the default 0.0.0.0 so the test doesn't have to worry about
+	// external-interface listeners. There is a small TOCTOU window between
+	// Close and the portStep's refreshConflicts, but the kernel won't
+	// reissue the same port to a different process that quickly.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
 	m := New("")
 	m.width = 120
 	m.height = 40
+	m.spec.Bind = "127.0.0.1"
 	for _, msg := range []tea.Msg{
 		KubeChosenMsg{Path: "/tmp/k.config", Context: "ctx"},
 		NsChosenMsg{Name: "default"},
 		ResourceTypeChosenMsg{Kind: "Pod"},
-		PortsLoadedMsg{Kind: "Pod", Object: "pod-1", Ports: []int{8080}, Pod: "pod-1"},
+		PortsLoadedMsg{Kind: "Pod", Object: "pod-1", Ports: []int{freePort}, Pod: "pod-1"},
 	} {
 		m2, _ := m.Update(msg)
 		m = m2.(Model)

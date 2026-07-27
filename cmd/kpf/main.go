@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,13 +56,17 @@ func main() {
 	case "forward":
 		runForwardCmd(os.Args[2:])
 	case "ls", "list":
-		runList()
+		runList(os.Args[2:])
 	case "stop":
 		runStop(os.Args[2:])
+	case "restart":
+		runRestart(os.Args[2:])
 	case "logs":
 		runLogs(os.Args[2:])
 	case "ping":
 		runPing()
+	case "doctor":
+		runDoctor()
 	case "namespaces", "ns":
 		runNamespaces(os.Args[2:])
 	case "version", "--version", "-v":
@@ -85,11 +90,14 @@ Usage:
   kpf daemon stop       Stop the background daemon
   kpf daemon status     Show daemon status
   kpf forward start ... Start a forward from the CLI
-  kpf ls                List active forwards
+  kpf forward restart <id>  Stop and re-start a forward with the same spec
+  kpf ls                List active forwards (--json, --watch/-w, --ns/--kind/--status)
   kpf stop <id>         Stop a single forward
   kpf stop --all        Stop all forwards
-  kpf logs <id>         Show / follow forward logs
+  kpf restart <id>      Stop and re-start a forward with the same spec
+  kpf logs [-f] <id>    Show / follow forward logs
   kpf ping              Check daemon reachability
+  kpf doctor            Health check (daemon / socket / state / listener parity)
   kpf namespaces PATH   List namespaces from a kubeconfig
   kpf version           Print version
   kpf help              This help
@@ -103,7 +111,7 @@ Environment:
 }
 
 // ---------------------------------------------------------------------------
-// TUI (placeholder — implemented in Phase 3)
+// TUI
 // ---------------------------------------------------------------------------
 
 func runTUI() {
@@ -453,7 +461,29 @@ func runPing() {
 	fmt.Printf("ok: version=%s uptime=%ds\n", res.Version, res.UptimeSec)
 }
 
-func runList() {
+func runList(args []string) {
+	fs := flag.NewFlagSet("ls", flag.ExitOnError)
+	jsonOut := fs.Bool("json", false, "output as JSON")
+	watch := fs.Bool("watch", false, "watch mode (re-print on forward events)")
+	watchShort := fs.Bool("w", false, "watch mode (shorthand)")
+	nsFilter := fs.String("ns", "", "filter by namespace")
+	kindFilter := fs.String("kind", "", "filter by resource kind")
+	statusFilter := fs.String("status", "", "filter by status")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintln(os.Stderr, "usage: kpf ls [--json|-w|--watch] [--ns NS] [--kind KIND] [--status STATUS]")
+		os.Exit(2)
+	}
+	if *watch || *watchShort {
+		runListWatch(*jsonOut, *nsFilter, *kindFilter, *statusFilter)
+		return
+	}
+	runListOnce(*jsonOut, *nsFilter, *kindFilter, *statusFilter)
+}
+
+func runListOnce(jsonOut bool, nsFilter, kindFilter, statusFilter string) {
 	client, _, err := newClient()
 	if err != nil {
 		die("config", err)
@@ -468,13 +498,134 @@ func runList() {
 	if err := client.Call(ctx, ipc.MethodForwardList, nil, &res); err != nil {
 		die("list", err)
 	}
-	if len(res.Forwards) == 0 {
+	forwards := filterForwards(res.Forwards, nsFilter, kindFilter, statusFilter)
+	sortForwardsByID(forwards)
+	if jsonOut {
+		printListJSON(forwards)
+		return
+	}
+	if len(forwards) == 0 {
 		fmt.Println("(no active forwards)")
 		return
 	}
+	printListTable(forwards)
+}
+
+// runListWatch subscribes to forward events and re-renders the list whenever
+// any state-change event arrives. Two ipc.Client instances are used because
+// SubscribeEvents owns the underlying reader goroutine — a Call on the same
+// client would race for ReadFrame.
+func runListWatch(jsonOut bool, nsFilter, kindFilter, statusFilter string) {
+	paths, err := resolvePaths()
+	if err != nil {
+		die("config", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	subClient := ipc.NewClient(paths.Socket)
+	defer subClient.Close()
+	ch, err := subClient.SubscribeEvents(ctx, ipc.MethodForwardEvents, map[string]bool{"ok": true})
+	if err != nil {
+		die("watch", err)
+	}
+
+	listClient := ipc.NewClient(paths.Socket)
+	defer listClient.Close()
+
+	refresh := func() {
+		ctx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel2()
+		var res ipc.ListForwardsResult
+		if err := listClient.Call(ctx2, ipc.MethodForwardList, nil, &res); err != nil {
+			fmt.Fprintf(os.Stderr, "list: %v\n", err)
+			return
+		}
+		forwards := filterForwards(res.Forwards, nsFilter, kindFilter, statusFilter)
+		sortForwardsByID(forwards)
+		if jsonOut {
+			// Stream snapshots as JSON lines (no clear-screen).
+			data, _ := json.Marshal(forwards)
+			fmt.Println(string(data))
+			return
+		}
+		fmt.Print("\033[2J\033[H")
+		printListTable(forwards)
+	}
+	refresh()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			// Log events fire on every log line — too high-frequency for a
+			// state-change watch. Filter to ready/dropped/stopped/stale/error.
+			switch ev.Event {
+			case ipc.EventForwardReady, ipc.EventForwardDropped, ipc.EventForwardStopped,
+				"forward.stale", "forward.error":
+				refresh()
+			}
+		}
+	}
+}
+
+// filterForwards applies --ns/--kind/--status filters. Empty filter strings
+// are no-ops; comparisons are case-insensitive for kind and status.
+func filterForwards(forwards []ipc.ForwardInfo, nsFilter, kindFilter, statusFilter string) []ipc.ForwardInfo {
+	if nsFilter == "" && kindFilter == "" && statusFilter == "" {
+		return forwards
+	}
+	out := make([]ipc.ForwardInfo, 0, len(forwards))
+	for _, f := range forwards {
+		if nsFilter != "" && f.Namespace != nsFilter {
+			continue
+		}
+		if kindFilter != "" && !strings.EqualFold(f.Kind, kindFilter) {
+			continue
+		}
+		if statusFilter != "" && !strings.EqualFold(f.Status, statusFilter) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// sortForwardsByID sorts the slice in place by ID ascending (lexicographic).
+// Manager.List returns forwards in Go map iteration order (random), so this
+// gives the CLI a stable, predictable row order regardless of arrival time.
+func sortForwardsByID(forwards []ipc.ForwardInfo) {
+	sort.Slice(forwards, func(i, j int) bool {
+		return forwards[i].ID < forwards[j].ID
+	})
+}
+
+// printListJSON emits the forwards as a JSON array (always non-nil). Suitable
+// for piping into `jq`.
+func printListJSON(forwards []ipc.ForwardInfo) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(forwards)
+}
+
+// printListTable emits forwards in tab-aligned columns. Caller is responsible
+// for the (no rows) check.
+func printListTable(forwards []ipc.ForwardInfo) {
 	w := tabWriter(os.Stdout)
 	fmt.Fprintln(w, "ID\tKUBECONFIG\tNAMESPACE\tKIND/OBJECT\tLOCAL→REMOTE\tSTATUS\tSTARTED")
-	for _, f := range res.Forwards {
+	for _, f := range forwards {
 		ports := formatPorts(f.Ports)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s/%s\t%s\t%s\t%s\n",
 			f.ID, truncate(f.Kubeconfig, 28), f.Namespace,
@@ -521,26 +672,259 @@ func runStop(args []string) {
 	fmt.Printf("stopped %s\n", id)
 }
 
-func runLogs(args []string) {
+func runRestart(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: kpf logs <id>")
+		fmt.Fprintln(os.Stderr, "usage: kpf restart <id>")
 		os.Exit(2)
 	}
+	id := args[0]
 	client, _, err := newClient()
 	if err != nil {
 		die("config", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := client.Connect(ctx); err != nil {
 		die("connect", err)
 	}
 	defer client.Close()
-	// Forward.events streams everything; logs is just a filtered view we'll
-	// implement when we have on-demand log subscriptions (Phase 6 polish).
-	_ = client
-	// For Phase 4, route the user through `forward.events`.
-	fmt.Fprintln(os.Stderr, "use: kpf forward events <id>  (Phase 6: dedicated logs)")
+	params, _ := json.Marshal(ipc.RestartForwardParams{ForwardID: id})
+	var res ipc.RestartForwardResult
+	if err := client.Call(ctx, ipc.MethodForwardRestart, params, &res); err != nil {
+		die("restart", err)
+	}
+	fmt.Printf("restarted %s: local=%v\n", res.ForwardID, res.LocalPorts)
+}
+
+// knownStatuses is the set of valid forward.Status values. Used by doctor
+// to flag any forward whose status doesn't match the lifecycle vocabulary.
+var knownStatuses = map[string]bool{
+	string("starting"): true, // forward.Status is unexported; constants are stringly
+	string("ready"):    true,
+	string("dropped"):  true,
+	string("stopped"):  true,
+	string("stale"):    true,
+	string("error"):    true,
+}
+
+// runDoctor performs a series of health checks against the running daemon
+// and exits with a status code reflecting the worst outcome:
+//   0 — all PASS
+//   1 — at least one WARN, no FAIL
+//   2 — at least one FAIL
+type doctorCheck struct {
+	name   string
+	level  int // 0=PASS, 1=WARN, 2=FAIL
+	detail string
+}
+
+func runDoctor() {
+	var results []doctorCheck
+
+	// 1. Daemon reachability (covers socket + ping in one call).
+	client, paths, err := newClient()
+	if err != nil {
+		results = append(results, doctorCheck{"config", 2, err.Error()})
+		printDoctor(results)
+		os.Exit(2)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		results = append(results, doctorCheck{"daemon-reachable", 2,
+			fmt.Sprintf("socket %s: %v", paths.Socket, err)})
+		printDoctor(results)
+		os.Exit(2)
+	}
+	defer client.Close()
+
+	var pingRes ipc.PingResult
+	if err := client.Call(ctx, ipc.MethodPing, nil, &pingRes); err != nil {
+		results = append(results, doctorCheck{"daemon-ping", 2, err.Error()})
+	} else {
+		results = append(results, doctorCheck{"daemon-ping", 0,
+			fmt.Sprintf("version=%s uptime=%ds", pingRes.Version, pingRes.UptimeSec)})
+	}
+
+	// 2. Forward list (state.json health).
+	var listRes ipc.ListForwardsResult
+	if err := client.Call(ctx, ipc.MethodForwardList, nil, &listRes); err != nil {
+		results = append(results, doctorCheck{"state-list", 2, err.Error()})
+	} else {
+		results = append(results, doctorCheck{"state-list", 0,
+			fmt.Sprintf("%d forward(s) tracked", len(listRes.Forwards))})
+	}
+
+	// 3. Listener parity (live vs claimed ports).
+	var liveRes ipc.LivePortsResult
+	if err := client.Call(ctx, ipc.MethodForwardLivePorts, nil, &liveRes); err != nil {
+		results = append(results, doctorCheck{"listener-parity", 2, err.Error()})
+	} else {
+		live := map[int]bool{}
+		for _, p := range liveRes.Ports {
+			live[p] = true
+		}
+		claimed := map[int]bool{}
+		for _, f := range listRes.Forwards {
+			if f.Status == "stopped" || f.Status == "stale" {
+				continue
+			}
+			for _, p := range f.Ports {
+				claimed[p.Local] = true
+			}
+		}
+		var orphan, missing []int
+		for p := range live {
+			if !claimed[p] {
+				orphan = append(orphan, p)
+			}
+		}
+		for p := range claimed {
+			if !live[p] {
+				missing = append(missing, p)
+			}
+		}
+		switch {
+		case len(orphan) > 0 || len(missing) > 0:
+			results = append(results, doctorCheck{"listener-parity", 1,
+				fmt.Sprintf("orphan=%v missing=%v", orphan, missing)})
+		default:
+			results = append(results, doctorCheck{"listener-parity", 0,
+				fmt.Sprintf("live=%v all claimed", sortedKeys(live))})
+		}
+	}
+
+	// 4. Stale forward count.
+	staleCount := 0
+	for _, f := range listRes.Forwards {
+		if f.Status == "stale" {
+			staleCount++
+		}
+	}
+	if staleCount > 0 {
+		results = append(results, doctorCheck{"stale-forwards", 1,
+			fmt.Sprintf("%d forward(s) marked stale (likely persistent 'not found' from backing pod)", staleCount)})
+	} else {
+		results = append(results, doctorCheck{"stale-forwards", 0, "none"})
+	}
+
+	// 5. Unknown status values.
+	unknownStatuses := map[string]int{}
+	for _, f := range listRes.Forwards {
+		if !knownStatuses[f.Status] {
+			unknownStatuses[f.Status]++
+		}
+	}
+	if len(unknownStatuses) > 0 {
+		results = append(results, doctorCheck{"status-vocabulary", 2,
+			fmt.Sprintf("unexpected statuses: %v", unknownStatuses)})
+	} else {
+		results = append(results, doctorCheck{"status-vocabulary", 0, "all statuses recognized"})
+	}
+
+	printDoctor(results)
+
+	worst := 0
+	for _, r := range results {
+		if r.level > worst {
+			worst = r.level
+		}
+	}
+	switch worst {
+	case 2:
+		os.Exit(2)
+	case 1:
+		os.Exit(1)
+	}
+}
+
+// printDoctor writes `[LEVEL] name: detail` lines in check order. The level
+// field is rendered as PASS/WARN/FAIL.
+func printDoctor(results []doctorCheck) {
+	for _, r := range results {
+		var tag string
+		switch r.level {
+		case 0:
+			tag = "PASS"
+		case 1:
+			tag = "WARN"
+		case 2:
+			tag = "FAIL"
+		}
+		fmt.Printf("[%s] %s: %s\n", tag, r.name, r.detail)
+	}
+}
+
+// sortedKeys returns the sorted int keys of a set map (for stable doctor
+// output in the listener-parity PASS line).
+func sortedKeys(m map[int]bool) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	// insertion sort is fine for tiny slices (port counts are small).
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}
+
+func runLogs(args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	follow := fs.Bool("f", false, "follow log output (block until stdin closes)")
+	followLong := fs.Bool("follow", false, "follow log output (block until stdin closes)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "usage: kpf logs [-f] <id>")
+		os.Exit(2)
+	}
+	id := fs.Arg(0)
+	doFollow := *follow || *followLong
+
+	client, _, err := newClient()
+	if err != nil {
+		die("config", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	params, _ := json.Marshal(ipc.LogsParams{ForwardID: id, Follow: doFollow})
+	ch, err := client.SubscribeEvents(ctx, ipc.MethodForwardLogs, params)
+	if err != nil {
+		die("logs", err)
+	}
+	go func() {
+		for ev := range ch {
+			if ev.Event != ipc.EventForwardLog {
+				continue
+			}
+			var p map[string]any
+			_ = json.Unmarshal(ev.Payload, &p)
+			ts, _ := p["ts"].(string)
+			stream, _ := p["stream"].(string)
+			line, _ := p["line"].(string)
+			fmt.Printf("%s\t%s\t%s\n", ts, stream, line)
+		}
+	}()
+	if !doFollow {
+		// Briefly sample then exit.
+		time.Sleep(500 * time.Millisecond)
+		return
+	}
+	c := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			if _, err := os.Stdin.Read(buf); err != nil {
+				close(c)
+				return
+			}
+		}
+	}()
+	<-c
 }
 
 // ---------------------------------------------------------------------------
@@ -549,14 +933,14 @@ func runLogs(args []string) {
 
 func runForwardCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: kpf forward start|list|stop|stopAll|events ...")
+		fmt.Fprintln(os.Stderr, "usage: kpf forward start|list|stop|stopAll|restart|events ...")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "start":
 		runForwardStart(args[1:])
 	case "list", "ls":
-		runList()
+		runList(args[1:])
 	case "stop":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: kpf forward stop <id>")
@@ -565,6 +949,8 @@ func runForwardCmd(args []string) {
 		runStop([]string{args[1]})
 	case "stopAll":
 		runStop([]string{"--all"})
+	case "restart":
+		runRestart(args[1:])
 	case "events":
 		runForwardEvents(args[1:])
 	default:

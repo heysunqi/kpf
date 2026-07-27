@@ -32,6 +32,12 @@ type Manager struct {
 	forwards map[string]*Forward
 	nextSeq  int
 
+	// history holds the last-known spec for every ID the manager has ever
+	// started. Entries outlive Stop so that a forward.restart IPC can look
+	// up the original spec and re-issue it with the same ID. Cleared on
+	// Shutdown — survives individual Stop calls but not daemon restarts.
+	history map[string]Spec
+
 	subsMu     sync.Mutex
 	subs       []chan Event
 }
@@ -44,6 +50,7 @@ func NewManager(log *slog.Logger) *Manager {
 	return &Manager{
 		log:      log,
 		forwards: make(map[string]*Forward),
+		history:  make(map[string]Spec),
 	}
 }
 
@@ -99,7 +106,15 @@ func (m *Manager) Start(opts StartOptions) (Info, error) {
 	} else {
 		m.nextSeq++
 		id = fmt.Sprintf("fwd_%04d", m.nextSeq)
+		spec.ID = id
 	}
+	m.mu.Unlock()
+
+	// Remember the spec so a subsequent forward.restart can re-issue it
+	// with the same ID. Spec.ID is set above so the key always matches the
+	// forward's actual ID.
+	m.mu.Lock()
+	m.history[id] = spec
 	m.mu.Unlock()
 
 	f := newForward(id, spec, m.log)
@@ -236,7 +251,8 @@ func (m *Manager) ClaimedPorts() []int {
 	return out
 }
 
-// Stop terminates a forward by id.
+// Stop terminates a forward by id. The spec is retained in history so that
+// a subsequent restart can re-issue it with the same ID; RemoveSpec clears it.
 func (m *Manager) Stop(id string) error {
 	m.mu.RLock()
 	f, ok := m.forwards[id]
@@ -286,6 +302,30 @@ func (m *Manager) Shutdown() {
 	}
 	m.subs = nil
 	m.subsMu.Unlock()
+	m.mu.Lock()
+	m.history = make(map[string]Spec)
+	m.mu.Unlock()
+}
+
+// Spec returns the last-known spec for an ID (i.e. the most recent spec the
+// manager accepted via Start). Returns ok=false if the ID has never been
+// started in this manager's lifetime. Specs outlive Stop — only Shutdown
+// and RemoveSpec clear them — so a restart is possible until then.
+func (m *Manager) Spec(id string) (Spec, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.history[id]
+	return s, ok
+}
+
+// RemoveSpec clears the retained spec for an ID. Call this when the spec is
+// no longer valid for a restart (e.g. the kubeconfig path it points to has
+// been deleted) or as part of explicit cleanup. Stop does NOT call this —
+// restartable history is the point.
+func (m *Manager) RemoveSpec(id string) {
+	m.mu.Lock()
+	delete(m.history, id)
+	m.mu.Unlock()
 }
 
 // relayEvents fans a single forward's events out to manager subscribers.

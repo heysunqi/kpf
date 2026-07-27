@@ -15,9 +15,11 @@ const (
 	MethodForwardList     = "forward.list"
 	MethodForwardStop     = "forward.stop"
 	MethodForwardStopAll  = "forward.stopAll"
+	MethodForwardRestart  = "forward.restart"
 	MethodForwardLogs     = "forward.logs"
 	MethodForwardEvents   = "forward.events"
 	MethodForwardClaimed  = "forward.claimedPorts"
+	MethodForwardLivePorts = "forward.livePorts"
 	MethodShutdown        = "shutdown"
 )
 
@@ -151,6 +153,24 @@ type ListForwardsResult struct {
 // StopForwardResult is the result of forward.stop.
 type StopForwardResult struct {
 	Stopped bool `json:"stopped"`
+}
+
+// RestartForwardParams is the parameters of forward.restart.
+type RestartForwardParams struct {
+	ForwardID string `json:"forward_id"`
+}
+
+// RestartForwardResult is the result of forward.restart. Mirrors
+// StartForwardResult — the new forward keeps the same ID and port mappings.
+type RestartForwardResult struct {
+	ForwardID  string `json:"forward_id"`
+	LocalPorts []int  `json:"local_ports"`
+}
+
+// LivePortsResult is the result of forward.livePorts — the local TCP ports
+// that kpf's portforwarders are currently bound to at the kernel level.
+type LivePortsResult struct {
+	Ports []int `json:"ports"`
 }
 
 // StopAllResult is the result of forward.stopAll.

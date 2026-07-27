@@ -179,8 +179,11 @@ func (h *Handler) Methods() *ipc.Handler {
 			ipc.MethodForwardList:    h.handleForwardList,
 			ipc.MethodForwardStop:    h.handleForwardStop,
 			ipc.MethodForwardStopAll: h.handleForwardStopAll,
+			ipc.MethodForwardRestart: h.handleForwardRestart,
 			ipc.MethodForwardEvents:  h.handleForwardEvents,
+			ipc.MethodForwardLogs:    h.handleForwardLogs,
 			ipc.MethodForwardClaimed: h.handleForwardClaimed,
+			ipc.MethodForwardLivePorts: h.handleForwardLivePorts,
 		},
 	}
 }
@@ -272,6 +275,42 @@ func (h *Handler) handleForwardStop(_ context.Context, conn *ipc.Conn, req ipc.R
 	return conn.WriteResponse(ipc.OK(req.ID, ipc.StopForwardResult{Stopped: true}))
 }
 
+// handleForwardRestart re-issues the spec for an ID against the daemon's
+// in-memory history (populated by Start, retained past Stop, cleared on
+// Shutdown). If the forward is currently alive it is stopped first; then
+// Start is called with the original spec, which preserves the ID via
+// Spec.ID. Returns not_found if the ID has no retained spec — e.g. it was
+// never started in this daemon, or Shutdown has run.
+func (h *Handler) handleForwardRestart(_ context.Context, conn *ipc.Conn, req ipc.Request) error {
+	var p ipc.RestartForwardParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return conn.WriteResponse(ipc.Fail(req.ID, ipc.ErrCodeBadRequest,
+			fmt.Sprintf("decode params: %v", err)))
+	}
+	spec, ok := h.manager.Spec(p.ForwardID)
+	if !ok {
+		return conn.WriteResponse(ipc.Fail(req.ID, ipc.ErrCodeNotFound,
+			fmt.Sprintf("forward %q not found in history", p.ForwardID)))
+	}
+	if _, alive := h.manager.Get(p.ForwardID); alive {
+		if err := h.manager.Stop(p.ForwardID); err != nil {
+			h.log.Warn("restart: stop before restart failed", "id", p.ForwardID, "err", err)
+		}
+	}
+	info, err := h.manager.Start(forward.StartOptions{
+		Spec:      spec,
+		WaitReady: 15 * time.Second,
+	})
+	if err != nil {
+		code := classifyStartError(err)
+		return conn.WriteResponse(ipc.Fail(req.ID, code, err.Error()))
+	}
+	return conn.WriteResponse(ipc.OK(req.ID, ipc.RestartForwardResult{
+		ForwardID:  info.ID,
+		LocalPorts: info.LocalPorts,
+	}))
+}
+
 func (h *Handler) handleForwardStopAll(_ context.Context, conn *ipc.Conn, req ipc.Request) error {
 	count := len(h.manager.List())
 	h.manager.StopAll()
@@ -301,6 +340,46 @@ func (h *Handler) handleForwardEvents(ctx context.Context, conn *ipc.Conn, req i
 	}
 }
 
+// handleForwardLogs subscribes the calling connection to log events for a
+// single forward. Same wire shape as forward.events: an OK ack, then a
+// stream of Event frames carrying forward.log payloads (stream + line).
+// The IPC client treats the OK frame as a no-op (SubscribeEvents unmarshals
+// every frame as an Event and continues on mismatch).
+func (h *Handler) handleForwardLogs(ctx context.Context, conn *ipc.Conn, req ipc.Request) error {
+	var p ipc.LogsParams
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return conn.WriteResponse(ipc.Fail(req.ID, ipc.ErrCodeBadRequest,
+			fmt.Sprintf("decode params: %v", err)))
+	}
+	if p.ForwardID == "" {
+		return conn.WriteResponse(ipc.Fail(req.ID, ipc.ErrCodeBadRequest, "forward_id is required"))
+	}
+	if _, ok := h.manager.Get(p.ForwardID); !ok {
+		return conn.WriteResponse(ipc.Fail(req.ID, ipc.ErrCodeNotFound,
+			fmt.Sprintf("forward %q not found", p.ForwardID)))
+	}
+	if err := conn.WriteResponse(ipc.OK(req.ID, map[string]bool{"ok": true})); err != nil {
+		return err
+	}
+	sub := h.manager.Subscribe()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case e, ok := <-sub:
+			if !ok {
+				return nil
+			}
+			if e.ForwardID != p.ForwardID || e.Type != forward.EventLog {
+				continue
+			}
+			if err := conn.WriteEvent(eventToWire(e)); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // handleForwardClaimed returns the local ports claimed by every registered
 // forward's spec — i.e. ports the manager considers taken. The TUI's
 // pre-flight uses this for authoritative conflict detection that doesn't
@@ -308,6 +387,16 @@ func (h *Handler) handleForwardEvents(ctx context.Context, conn *ipc.Conn, req i
 func (h *Handler) handleForwardClaimed(_ context.Context, conn *ipc.Conn, req ipc.Request) error {
 	ports := h.manager.ClaimedPorts()
 	return conn.WriteResponse(ipc.OK(req.ID, ipc.ClaimedPortsResult{Ports: ports}))
+}
+
+// handleForwardLivePorts returns the local TCP ports that kpf's
+// portforwarders are currently bound to (kernel-level, not spec-declared).
+// Used by `kpf doctor` for listener-parity checks. Returns nil (not an
+// empty slice) when no forward has reached Ready yet — distinguishing
+// "haven't checked" from "checked, none bound".
+func (h *Handler) handleForwardLivePorts(_ context.Context, conn *ipc.Conn, req ipc.Request) error {
+	ports := h.manager.LivePorts()
+	return conn.WriteResponse(ipc.OK(req.ID, ipc.LivePortsResult{Ports: ports}))
 }
 
 // ---------------------------------------------------------------------------

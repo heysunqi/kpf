@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"sort"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -107,6 +108,12 @@ func loadForwardsCmd(socket string) tea.Cmd {
 				StartedAt:  startedAt,
 			})
 		}
+		// Manager.List returns forwards in Go map iteration order (random),
+		// so the active view would re-shuffle on every refresh. Pin the order
+		// by ID ascending — matches what `kpf ls` prints on the CLI side.
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].ID < out[j].ID
+		})
 		return ForwardsLoadedMsg{List: out, Err: nil}
 	}
 }
