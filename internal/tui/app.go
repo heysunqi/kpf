@@ -492,7 +492,7 @@ func defaultResourceTypes() []mockResourceType {
 func (m Model) isAnyListFiltering() bool {
 	switch m.step {
 	case stepKubeconfig:
-		return m.kube.list.FilterState() == list.Filtering
+		return m.kube.filtering()
 	case stepNamespace:
 		return m.ns.list.FilterState() == list.Filtering
 	case stepResource:

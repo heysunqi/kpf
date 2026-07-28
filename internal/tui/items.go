@@ -5,8 +5,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/lipgloss"
-
-	"kpf/internal/kubeconfig"
 )
 
 // NewDefaultDelegate returns a styled default delegate with description.
@@ -27,18 +25,6 @@ func NewDefaultDelegate() *list.DefaultDelegate {
 		Foreground(muted)
 	d.SetSpacing(0)
 	return &d
-}
-
-// kubeItem implements list.Item for a kubeconfig.
-type kubeItem struct {
-	entry kubeconfig.Entry
-}
-
-func (i kubeItem) FilterValue() string { return i.entry.Basename }
-func (i kubeItem) Title() string       { return i.entry.Basename }
-func (i kubeItem) Description() string {
-	return fmt.Sprintf("cluster=%s ctx=%s users=%d",
-		joinShort(i.entry.Clusters), i.entry.CurrentContext, len(i.entry.Users))
 }
 
 // nsItem implements list.Item for a namespace.
