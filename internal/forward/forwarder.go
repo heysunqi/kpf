@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,23 @@ import (
 
 	"kpf/internal/kubeconfig"
 )
+
+// probeInterval is how often the post-ready health probe dials each local
+// forwarded port. Short enough to detect a dead forwarder before the user's
+// next request hits a wedged accept loop, long enough to be invisible at
+// idle. The probe doesn't traverse SPDY itself (it stops at the kernel
+// listener) but combined with client-go's SPDY-level ping (5s) and the
+// kpf reconnect loop, it forms a three-tier liveness stack:
+//
+//	1. SPDY ping      (5s)  — surfaces "kubelet not responding" to klog
+//	2. local-port probe (5s) — surfaces "accept loop / kernel listener dead"
+//	3. user request   (∞)  — last-resort: surfaces "SPDY half-dead but kernel OK"
+//
+// The probe only triggers an explicit Close when the kernel refuses the
+// dial. The other tiers surface through ForwardPorts's existing
+// CloseChan() select (see portforward.go:339-344), which our Run() loop
+// already converts into a backoff reconnect.
+const probeInterval = 5 * time.Second
 
 // Forward holds the state of one active port-forward.
 type Forward struct {
@@ -219,9 +238,22 @@ func (f *Forward) runOnce() error {
 		return nil
 	}
 
+	// Post-ready health probe: surfaces "accept loop dead" / "kernel
+	// listener gone" faster than the user's next request. Doesn't catch
+	// every SPDY half-death (those go through the upstream
+	// streamConn.CloseChan() select below) but closes the gap for the
+	// common case where the listener is gone but the SPDY conn is still
+	// alive enough not to fail a read.
+	healthDone := make(chan struct{})
+	go func() {
+		defer close(healthDone)
+		f.runHealthCheck()
+	}()
+
 	// Once ready, wait for an unexpected drop or stop.
 	select {
 	case err := <-pfErrCh:
+		<-healthDone // probe exits via its own stopCh branch on pf.Close
 		if f.IsStopped() {
 			f.setStatus(StatusStopped, nil)
 			f.broadcast(Event{Type: EventStopped})
@@ -231,6 +263,7 @@ func (f *Forward) runOnce() error {
 		return errors.New(msg)
 	case <-f.stopCh:
 		<-pfErrCh // drain
+		<-healthDone
 		f.setStatus(StatusStopped, nil)
 		f.broadcast(Event{Type: EventStopped})
 		return nil
@@ -296,6 +329,66 @@ func (f *Forward) dial() error {
 	f.pf = pf
 	f.mu.Unlock()
 	return nil
+}
+
+// runHealthCheck probes each local forwarded port every probeInterval. If a
+// port's kernel listener refuses a dial (e.g. accept loop crashed or the
+// port was externally closed), the probe calls f.pf.Close() which causes
+// ForwardPorts() to return via its streamConn.CloseChan() select (see
+// portforward.go:339-344). The outer Run() loop then surfaces this as a
+// drop and reconnects via backoff.
+//
+// The probe is a kernel-level check — it does not traverse SPDY. That means
+// it can't detect the "SPDY half-dead but kernel listener alive" failure
+// mode (kubelet crashed but TCP FIN not yet delivered). For that we rely on
+// client-go's SPDY-level ping (5s, already on by default via RoundTripperFor)
+// and the kpf backoff loop. See the package comment on probeInterval for
+// the three-tier liveness story.
+func (f *Forward) runHealthCheck() {
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-f.stopCh:
+			return
+		case <-ticker.C:
+		}
+		if !f.probeLocalPorts() {
+			return
+		}
+	}
+}
+
+// probeLocalPorts dials each spec.Ports[i].Local once with a 2s timeout.
+// On the first dial failure it calls pf.Close() (which propagates to the
+// outer select via pfErrCh) and returns false. Returns true if all ports
+// dialed cleanly or if there's no portforwarder yet (e.g. between dial and
+// Ready).
+func (f *Forward) probeLocalPorts() bool {
+	f.mu.Lock()
+	pf := f.pf
+	bind := f.spec.Bind
+	ports := append([]PortPair(nil), f.spec.Ports...)
+	f.mu.Unlock()
+
+	if pf == nil {
+		return true
+	}
+
+	for _, p := range ports {
+		addr := net.JoinHostPort(bind, strconv.Itoa(p.Local))
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			if f.log != nil {
+				f.log.Warn("forward health probe failed; closing portforwarder",
+					"id", f.id, "local", p.Local, "err", err)
+			}
+			pf.Close()
+			return false
+		}
+		_ = conn.Close()
+	}
+	return true
 }
 
 // shutdown closes all subscriber channels and releases the portforwarder's
