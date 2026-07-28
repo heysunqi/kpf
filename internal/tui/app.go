@@ -499,8 +499,8 @@ func (m Model) isAnyListFiltering() bool {
 		return m.rt.list.FilterState() == list.Filtering
 	case stepObject:
 		return m.obj.list.FilterState() == list.Filtering
-	case stepActive:
-		return m.active.list.FilterState() == list.Filtering
 	}
+	// stepActive uses bubbles/table which has no built-in filtering, so
+	// there's nothing to yield to here.
 	return false
 }

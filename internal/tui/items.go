@@ -101,39 +101,6 @@ func (i objectItem) Description() string {
 	return joinComma(parts)
 }
 
-type activeItem struct {
-	id       string
-	cluster  string
-	ns       string
-	resource string
-	bind     string
-	ports    string
-	status   string
-	age      string
-}
-
-func (i activeItem) FilterValue() string { return i.id + " " + i.resource }
-func (i activeItem) Title() string       { return fmt.Sprintf("%s  %s", i.id, i.resource) }
-func (i activeItem) Description() string {
-	statusStr := i.status
-	switch statusStr {
-	case "ready":
-		statusStr = StatusOK.Render("● " + statusStr)
-	case "starting":
-		statusStr = StatusWarn.Render("◐ " + statusStr)
-	case "dropped", "reconnecting":
-		statusStr = StatusWarn.Render("⚠ " + statusStr)
-	case "stopped":
-		statusStr = StatusErr.Render("○ " + statusStr)
-	case "stale":
-		statusStr = StatusErr.Render("✗ " + statusStr)
-	case "error":
-		statusStr = StatusErr.Render("! " + statusStr)
-	}
-	return fmt.Sprintf("%s  %s/%s  bind=%s  ports=%s  age=%s",
-		statusStr, i.cluster, i.ns, i.bind, i.ports, i.age)
-}
-
 // helpers
 
 func joinShort(s []string) string {
