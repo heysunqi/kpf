@@ -38,12 +38,13 @@
 - **Stale 终结**：连续 3 次 `pod not found` 自动把 forward 标记为 `stale` 并停止重试，避免无效打日志。
 - **端口冲突检测**：转发启动前 `tryListen` 探测本地端口，命中直接返回 `port_in_use`，错误信息保留原 cause。daemon 还扫描 manager 里所有已注册 forward 的 `spec.Ports`，对**已经声明但还没 bind 到内核**的端口（处于 SPDY dial 阶段）也一并拒绝——避免两次提交都被 OS 级 `tryListen` 漏判的竞态。TUI 在第 ⑤ 步还会做一次**双源预检**：本地 `bind() + close()` 探测 + 通过 `forward.claimedPorts` IPC 拉 daemon 的权威声明表，命中任何一个就在输入框右侧出现 `✗ in use` 红色提示；按 Enter 时若仍有冲突则直接拦下并提示哪个端口冲突（含持有该端口的 forward id），省掉 IPC 往返。Forward goroutine 的 `runOnce` 也补了一个 `pfErrCh` 分支——bind 失败不会再卡在 `starting` 状态。
 - **监听器泄漏防护**：`shutdown()` 显式调用 `pf.Close()`，并在重试循环中关闭旧实例，杜绝僵尸 socket。
+- **三层保活**：Forward 进入 Ready 后启动 `runHealthCheck` goroutine，每 `probeInterval = 5s` 对每个本地端口做一次 `net.DialTimeout(2s)`；kernel 拒绝 → `pf.Close()` → `ForwardPorts()` 经 `CloseChan` 退出 → Run 走 backoff 重连。这是应用层兜底，**不依赖** SPDY ping / TCP keepalive 是否被沿途 NAT 吃掉。三层叠加：client-go 内置 SPDY ping (5s) + kpf 主动探针 (5s) + 用户请求触发。详见 `internal/forward/forwarder.go` 的 `runHealthCheck` / `probeLocalPorts`。
 - **状态原子持久化**：`state.json` 通过 temp + rename + fsync 写入，永不出现半截文件。
 
 ### 多集群与多 kubeconfig
 
 - 自动扫描 `~/.kube`（或 `KPF_KUBECONFIG_DIR`）下的所有 kubeconfig，**按路径去重**（同一文件被多个目录链入只取一份）。
-- TUI 一次列出所有可用 kubeconfig；启动 forward 时按所选文件路径落库到 `state.json`，重启后 daemon 能直接按路径找回同一份 client config。
+- TUI 一次列出所有可用 kubeconfig（**5 列表格**：BASENAME/CTX/CLUSTERS/CONTEXTS/USERS）；启动 forward 时按所选文件路径落库到 `state.json`，重启后 daemon 能直接按路径找回同一份 client config。
 
 ### 守护进程审计
 
@@ -55,8 +56,8 @@
 
 ### 交互体验
 
-- **5 步向导 TUI**：kubeconfig → namespace → 资源类型 → 对象 → 端口，全程 `/` 过滤，`↑/↓` 选择，`enter` 确认，`esc` 回退。
-- **Active 视图**：所有正在运行的 forward 列表，自动 1.5s tick + 事件订阅双驱动刷新，状态色块化（● ready / ◐ starting / ⚠ dropped / ○ stopped / ✗ stale）。
+- **5 步向导 TUI**：kubeconfig → namespace → 资源类型 → 对象 → 端口。**kubeconfig** 用 `bubbles/table` 列展示（信息密度高）；**namespace / resource / object** 仍用 list 列表，保留 `/` 过滤；**端口**用 textinput。`↑/↓` 选择，`enter` 确认，`esc` 回退。
+- **Active 视图**：所有正在运行的 forward **8 列表格**展示（ID / STATUS / KIND/OBJECT / NS / BIND / PORTS / CLUSTER / AGE），自动 1.5s tick + 事件订阅双驱动刷新，状态色块化（● ready / ◐ starting / ⚠ dropped / ○ stopped / ✗ stale）。光标定位选中行，`d` / `x` / `delete` 通过 Cursor 索引回 forward id 后停止。
 - **Active 视图快捷键**：`d` / `x` / `delete` 一键停止选中 forward；删除结果实时回显到状态行。
 - **Loading 状态**：第 ⑤ 步按 Enter 后渲染转圈 spinner，并禁用再次按 Enter，防止 k8s dial 慢时连按导致重复 forward（多个 starting 卡死）。
 - **Stale "not found" 修复**：删除成功的 forward 不会再因为 IPC 二次触发而显示红色错误 —— 把 "用户按 d" 和 "IPC 返回" 拆成两个独立消息类型。
@@ -110,8 +111,8 @@ internal/
 ├── k8s/                      clientset facade + 端口提取 + selector → pod
 ├── forward/                  Forward + Manager + 退避 + 端口冲突检测
 ├── daemon/                   IPC handlers + 生命周期 + 持久化 + 审计
-└── tui/                      Bubble Tea 向导（5 步 + active 视图）
-                              + IPC bridge + 事件订阅 watcher
+└── tui/                      Bubble Tea 向导（5 步 + 8 列 active 视图）
+                              + IPC bridge + 事件订阅 watcher + bubbles/table
 ```
 
 ### IPC 协议（一行摘要）
@@ -129,7 +130,10 @@ JSON over Unix socket，每条消息 `Request{ID, Method, Params}` / `Response{I
 | `forward.list`                  | 列当前所有转发                      |
 | `forward.stop` / `forward.stopAll` | 停止                                |
 | `forward.events`                | **订阅**事件流（ready/dropped/...）|
+| `forward.logs`                  | 订阅单条 forward 的 log 事件流      |
+| `forward.restart`               | 用同一 spec 重启（保留 ID）         |
 | `forward.claimedPorts`          | 取 daemon manager 已声明的本地端口（TUI 预检用）|
+| `forward.livePorts`             | 取 kpf 实际持有的内核监听端口（doctor 用）|
 | `shutdown`                      | 关闭 daemon（带外调试用）           |
 
 完整 schema 见 [`internal/ipc/protocol.go`](internal/ipc/protocol.go)。
@@ -317,6 +321,39 @@ Active 视图状态色块：
 | `stale`        | ✗ 红色     | pod 连续 3 次 not found，停止重试           |
 | `error`        | ! 红色     | 不可恢复错误                                |
 
+### Active 视图列
+
+8 列固定宽度，宽度和 = 115 cell，配合 cell padding=0 在 ≥120 字符终端整齐对齐：
+
+| 列            | 宽度 | 内容                                       |
+| ------------- | ---- | ------------------------------------------ |
+| ID            | 9    | `fwd_NNNN` 唯一标识                        |
+| STATUS        | 12   | 图标 + 状态名（颜色见上表）                |
+| KIND/OBJECT   | 22   | `Pod/my-pod` 格式                          |
+| NS            | 11   | Namespace（按字符截断）                    |
+| BIND          | 11   | 本地绑定地址                                |
+| PORTS         | 24   | `local:remote` 列表，逗号分隔              |
+| CLUSTER       | 16   | kubeconfig basename                        |
+| AGE           | 10   | 启动时间，按 `…` 截断                      |
+
+超长内容走 ANSI-safe `runewidth.Truncate` / `lipgloss.NewStyle().MaxWidth(...)` 截断，保证不撕裂。`d` / `x` / `delete` 通过 `table.Cursor()` 索引回 `forwards []ipcForward` 平行切片拿到 ID，然后走 `StopForwardMsg` → `forward.stop` IPC。
+
+### Kubeconfig 选择列
+
+5 列固定宽度，宽度和 = 78 cell，能塞进 80 字符终端：
+
+| 列         | 宽度 | 内容                                |
+| ---------- | ---- | ----------------------------------- |
+| BASENAME   | 22   | kubeconfig 文件名（按字符截断）     |
+| CTX        | 22   | 当前 context                        |
+| CLUSTERS   | 12   | `N clusters` 数量摘要               |
+| CONTEXTS   | 12   | `N contexts` 数量摘要               |
+| USERS      | 10   | `N users` 数量摘要                  |
+
+`enter` 通过 Cursor 索引回 `entries []kubeconfig.Entry` 平行切片，发 `KubeChosenMsg` 带 Path + CurrentContext。
+
+> 这两步用 `bubbles/table` 而不是 list，是因为**信息密度**更高（5–8 列同时可见，无需展开）。代价是失去 list 自带的 `/` 过滤 —— 当前用不上：kubeconfig 数量天然少，Active 视图用 `kpf ls --ns / --kind / --status` 在 CLI 里过滤更顺手。
+
 ---
 
 ## 状态、socket、日志
@@ -382,7 +419,8 @@ kpf/
     ├── k8s/                     clientset + 端口提取 + workload → pod 解析
     ├── forward/                 Forward + Manager + 退避 + 端口冲突检测 + LivePorts()
     ├── daemon/                  IPC handler + 生命周期 + 持久化 + 监听器审计
-    └── tui/                     Bubble Tea 向导（5 步 + active 视图）+ 事件订阅
+    └── tui/                     Bubble Tea 向导（5 步 + 8 列 active/5 列 kubeconfig 表）
+                                  + bubbles/table + IPC bridge + 事件订阅
 ```
 
 ---
