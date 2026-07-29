@@ -421,6 +421,57 @@ kpf/
     ├── daemon/                  IPC handler + 生命周期 + 持久化 + 监听器审计
     └── tui/                     Bubble Tea 向导（5 步 + 8 列 active/5 列 kubeconfig 表）
                                   + bubbles/table + IPC bridge + 事件订阅
+├── scripts/build-release.sh      跨平台 release 打包脚本（CI 也调用这个）
+└── .github/workflows/            ci.yml / release.yml / stale.yml
+```
+
+---
+
+## 开发与发布
+
+### 日常开发
+
+```sh
+make help                     # 列出所有 target
+make build                    # 构建 bin/kpf（-trimpath）
+make test                     # go test -race -count=1 ./...
+make vet                      # go vet ./...
+make fmt                      # gofmt ./...
+```
+
+### 本地复现 CI release 构建
+
+CI（`.github/workflows/release.yml`）和本地共用同一个脚本 — 本地打包出来的产物结构、命名、checksums 与 CI 完全一致：
+
+```sh
+make release                  # 等价 ./scripts/build-release.sh
+make release VERSION=0.1.2    # 指定版本号（覆盖自动解析的 const version）
+
+# 产物路径
+ls dist/
+#   kpf-<VERSION>-linux-amd64.tar.gz
+#   kpf-<VERSION>-linux-arm64.tar.gz
+#   kpf-<VERSION>-darwin-amd64.tar.gz
+#   kpf-<VERSION>-darwin-arm64.tar.gz
+#   kpf-<VERSION>-SHASUMS256.txt
+```
+
+### 发版流程
+
+```sh
+# 1. bump version
+$EDITOR cmd/kpf/main.go       # 把 const version = "0.1.x" 改成新版本
+
+# 2. 提交 + push
+git commit -am "kpf: bump version to 0.1.x"
+git push origin main
+
+# 3. 打 tag（push 后 release workflow 自动触发）
+make tag VERSION=0.1.x        # 等价 git tag -a v0.1.x -m "kpf v0.1.x"
+git push origin v0.1.x
+
+# → .github/workflows/release.yml 自动跑 matrix build + 聚合 + 发布
+# → 资产覆盖式上传（replace_assets=true），重推同一 tag 不会留垃圾
 ```
 
 ---

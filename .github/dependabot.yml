@@ -1,0 +1,44 @@
+# Dependabot config — keep GitHub Actions versions fresh automatically.
+#
+# Two ecosystems are tracked:
+#   - github-actions: catches when actions/checkout, setup-go, etc. ship
+#     security patches or major-version bumps (the Node 20 → 24 cycle
+#     would have been flagged here automatically).
+#   - gomod: catches upstream bubbles/lipgloss/bubbletea security fixes.
+#
+# Both groups are scoped to monthly cadence — weekly noise from Dependabot
+# drowns out signal for a project this size.
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Pin actions/checkout + setup-go major bumps are risk-free for this
+    # repo — the workflow uses them only for checkout and module cache.
+    # Other actions (upload-artifact, download-artifact, etc.) are
+    # reviewed manually when they propose a major bump.
+    groups:
+      github-actions-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Group all gomod updates into a single PR so reviewers get one
+    # atomic snapshot to assess compatibility, not a stream of single-
+    # module PRs.
+    groups:
+      gomod-all:
+        patterns:
+          - "*"
+
+# Reasonable PR limits — with two ecosystems × monthly cadence, the
+# absolute cap rarely bites, but keep it just in case.
+open-pull-requests-limit: 5

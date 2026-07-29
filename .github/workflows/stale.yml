@@ -1,0 +1,55 @@
+# Stale bot — keep the issue / PR backlog tidy.
+#
+#   - 60 days without activity → marks as stale (a comment is posted
+#     explaining the bot is about to close it).
+#   - 7 days after stale → closes the issue/PR.
+#
+# Exceptions:
+#   - Pinned issues are never marked stale.
+#   - Issues with the `keep-open` label are exempt — that's the escape
+#     hatch for long-running discussions or feature parking lots.
+#   - PRs: only stale-close after 30 days, not 60. PRs without activity
+#     for 60 days are usually superseded work, not something to ping
+#     the author about again.
+name: stale
+
+on:
+  schedule:
+    # 03:00 UTC daily. GitHub Actions cron runs in UTC.
+    - cron: '0 3 * * *'
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          # days before issue/PR is marked stale
+          days-before-stale: 60
+          # days after stale before close
+          days-before-close: 7
+          # PRs move faster (see comment above)
+          days-before-pr-stale: 30
+          days-before-pr-close: 7
+          # exempt anything pinned or tagged keep-open
+          exempt-issue-labels: 'keep-open,pinned'
+          exempt-pr-labels: 'keep-open,pinned'
+          # limit per run so a huge backlog doesn't churn everything at once
+          operations-per-run: 50
+          # message left on items about to be closed
+          close-issue-message: |
+            This issue has been closed because it has been stale for 7 days with no activity.
+            If you want to keep this open, please add the `keep-open` label or post an update.
+          close-pr-message: |
+            This PR has been closed because it has been stale for 7 days with no activity.
+            If you want to keep this open, please add the `keep-open` label or post an update.
+          stale-issue-message: |
+            This issue is stale because it has been open for 60 days with no activity.
+            It will be closed in 7 days unless you add the `keep-open` label or post an update.
+          stale-pr-message: |
+            This PR is stale because it has been open for 30 days with no activity.
+            It will be closed in 7 days unless you add the `keep-open` label or post an update.
