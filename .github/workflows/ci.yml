@@ -1,0 +1,45 @@
+# kpf CI — runs on every push and PR.
+#
+# Gates merges on: build, vet, test. Caches Go modules for fast iteration.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      # Plain build catches compile errors across the whole tree — cheaper
+      # than building each package individually.
+      - name: Build
+        run: go build ./...
+
+      # go vet enforces a baseline of static checks (printf format strings,
+      # unreachable code, lock copying, etc.) on every PR.
+      - name: Vet
+        run: go vet ./...
+
+      # Run the test suite. -race catches data races (kpf has goroutines in
+      # the daemon manager and the IPC server). -count=1 disables the test
+      # cache so a stale green isn't reported after a partial regression.
+      - name: Test
+        run: go test -race -count=1 ./...
