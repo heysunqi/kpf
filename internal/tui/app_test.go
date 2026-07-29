@@ -77,6 +77,40 @@ func TestApp_QuitOnQ(t *testing.T) {
 	}
 }
 
+// TestApp_QGoesIntoPortInputWhenFocused is the inverse guard for the
+// q-quit binding. At the port step, a textinput is usually focused for
+// editing a port number. The global q handler must NOT fire there or
+// the user can't finish the wizard — the key needs to land in the
+// input. ctrl+c remains the always-available escape hatch.
+func TestApp_QGoesIntoPortInputWhenFocused(t *testing.T) {
+	m := New("")
+	m.width = 120
+	m.height = 40
+	m.step = stepPort
+	// Construct a port step with one focused input — matches the
+	// post-Init state of the wizard.
+	m.port = newPortStep([]int{80}, "127.0.0.1")
+	m.port.focused = 0
+	m.port.inputs[0].Focus()
+
+	m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if cmd == nil {
+		// A non-quit cmd is fine (textinput echoes back its own state
+		// or signals Blink). What we forbid is a tea.Quit.
+		m2, cmd = m.Update(nil) // nothing, just to satisfy the compiler
+		_ = m2
+	}
+	if cmd != nil {
+		if _, isQuit := cmd().(tea.QuitMsg); isQuit {
+			t.Fatal("q at stepPort with focused textinput must not trigger tea.Quit")
+		}
+	}
+	m = m2.(Model)
+	if m.step == stepQuitting {
+		t.Error("step should not have transitioned to stepQuitting when textinput is focused at stepPort")
+	}
+}
+
 func TestApp_KubeToNsTransition(t *testing.T) {
 	m := New("")
 	m.width = 120

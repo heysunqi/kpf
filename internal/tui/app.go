@@ -165,6 +165,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// before; the table-based kubeconfig + active steps don't,
 			// so handle it here so the footer's "q quit" promise holds
 			// across all steps.
+			//
+			// Exception: at the port step, a textinput might be focused
+			// for editing a port number; if we intercept q there it
+			// shoves an unwanted "q" character into the input AND quits,
+			// making the wizard unfinishable. Defer to the step so the
+			// input receives the keypress; the user still has ctrl+c.
+			if m.step == stepPort && m.port.focused >= 0 {
+				break
+			}
 			m.step = stepQuitting
 			m.bridge.close()
 			return m, tea.Quit
