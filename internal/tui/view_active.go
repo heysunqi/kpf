@@ -82,8 +82,8 @@ func activePlainStatus(status string) string {
 		return "● ready"
 	case "starting":
 		return "◐ starting"
-	case "dropped", "reconnecting":
-		return "⚠ " + status
+	case "dropped":
+		return "⚠ dropped"
 	case "stopped":
 		return "○ stopped"
 	case "stale":
@@ -103,8 +103,8 @@ func activeStatusParts(status string) (string, lipgloss.Style) {
 		return "● ready", StatusOK
 	case "starting":
 		return "◐ starting", StatusWarn
-	case "dropped", "reconnecting":
-		return "⚠ " + status, StatusWarn
+	case "dropped":
+		return "⚠ dropped", StatusWarn
 	case "stopped":
 		return "○ stopped", StatusErr
 	case "stale":
@@ -153,20 +153,52 @@ func (a activeStep) View() string {
 	sep := strings.Repeat("─", activeTotalRowWidth())
 
 	cursor := a.table.Cursor()
-	rowLines := make([]string, 0, len(a.forwards))
-	for i, f := range a.forwards {
-		line := renderActiveRow(f)
-		if i == cursor {
+	n := len(a.forwards)
+
+	// Decide which slice of [start,end) to render. When forwards exceed
+	// a.height we slide the window so the cursor row is always visible,
+	// and we always render exactly a.height rows (padding the tail with
+	// blank lines so the body height stays stable — important so the
+	// header doesn't shift when the cursor crosses a window boundary).
+	visible := a.height
+	if visible < 1 || visible > n {
+		visible = n
+	}
+	start, end := 0, n
+	if n > visible {
+		// Keep cursor in [start, end). When the cursor is near the top
+		// we anchor at 0; when it moves down we slide so cursor sits
+		// at the last row of the window.
+		start = cursor - (visible - 1)
+		if start < 0 {
+			start = 0
+		}
+		end = start + visible
+		if end > n {
+			end = n
+			start = end - visible
+			if start < 0 {
+				start = 0
+			}
+		}
+	}
+
+	rowLines := make([]string, visible)
+	for i := 0; i < visible; i++ {
+		fwdIdx := start + i
+		if fwdIdx >= end {
+			rowLines[i] = strings.Repeat(" ", activeTotalRowWidth())
+			continue
+		}
+		line := renderActiveRow(a.forwards[fwdIdx])
+		if fwdIdx == cursor {
 			line = activeSelectedRowStyle.Render(line)
 		}
-		rowLines = append(rowLines, line)
-	}
-	if a.height > 0 && len(rowLines) > a.height {
-		rowLines = rowLines[:a.height]
+		rowLines[i] = line
 	}
 
 	body := strings.Join(rowLines, "\n")
-	if body == "" {
+	if n == 0 {
 		body = "(no active forwards)"
 	}
 

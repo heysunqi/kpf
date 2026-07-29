@@ -133,6 +133,61 @@ func TestActiveStep_TruncatesLongContent(t *testing.T) {
 	}
 }
 
+// TestActiveStep_ScrollsCursorIntoView locks in the window-slide
+// behavior introduced after we replaced bubbles/table's View() with our
+// own renderer. bubbles/table used to handle viewport scrolling
+// internally (visible rows anchored by cursor); once we rerendered by
+// hand we had to reimplement that, otherwise a tall forward list
+// silently hides the cursor — user presses down forever and the
+// highlighted row stays at the top.
+//
+// We set height to 5 via WindowSizeMsg, place the cursor at row 25 of
+// a 50-row list, and assert that the cursor row's ID is in the
+// rendered body.
+func TestActiveStep_ScrollsCursorIntoView(t *testing.T) {
+	forwards := make([]ipcForward, 50)
+	for i := range forwards {
+		forwards[i] = ipcForward{
+			ID:         idForIndex(i),
+			Status:     "ready",
+			Namespace:  "default",
+			Kind:       "Pod",
+			Object:     "pod",
+			Bind:       "127.0.0.1",
+			Ports:      "8080:80",
+			Kubeconfig: "cfg",
+			StartedAt:  "2026-07-28",
+		}
+	}
+	s := newActiveStep(forwards)
+	// 5 visible rows: height = msg.Height - 6, so msg.Height = 11
+	s, _ = s.Update(tea.WindowSizeMsg{Width: 200, Height: 11})
+	s.table.SetCursor(25)
+
+	v := s.View()
+	if !strings.Contains(v, idForIndex(25)) {
+		t.Errorf("cursor row %q should be visible after window-slide, view:\n%s",
+			idForIndex(25), v)
+	}
+	// And only 5 rows should render (window fixed-height body).
+	var renderedRows int
+	for _, line := range strings.Split(v, "\n") {
+		if strings.HasPrefix(line, "fwd_") {
+			renderedRows++
+		}
+	}
+	if renderedRows != 5 {
+		t.Errorf("expected exactly 5 rows in fixed-height body, got %d", renderedRows)
+	}
+}
+
+// idForIndex builds a "fwd_NN" id matching the convention used in this
+// file's other tests so the rendered strings are easy to grep for.
+func idForIndex(i int) string {
+	const digits = "0123456789"
+	return "fwd_" + string(digits[i/10]) + string(digits[i%10])
+}
+
 // TestActiveStep_ColumnsAreAligned is the regression test for the
 // "columns misaligned because runewidth.Truncate eats ANSI bytes" bug:
 // when status cells were passed to bubbles/table as ANSI-painted text,
