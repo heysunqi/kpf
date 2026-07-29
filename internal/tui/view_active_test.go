@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // TestActiveStep_RendersTableNotPanic locks in that the new table-based
@@ -129,5 +130,59 @@ func TestActiveStep_TruncatesLongContent(t *testing.T) {
 	v := step.View()
 	if v == "" {
 		t.Error("long-content row should still render something")
+	}
+}
+
+// TestActiveStep_ColumnsAreAligned is the regression test for the
+// "columns misaligned because runewidth.Truncate eats ANSI bytes" bug:
+// when status cells were passed to bubbles/table as ANSI-painted text,
+// its runewidth.Truncate counted the escape bytes as content characters
+// and chopped the cell at the wrong offset, shifting every subsequent
+// column by several cells. The fix rerenders the table ourselves with
+// lipgloss-aware padding, so the visual cell widths must equal the sum
+// of column widths plus the single-space separators — exactly
+// 9+12+22+11+11+24+16+10 + 7 = 122 visible cells per row.
+//
+// The test parses the View() output, skips the title / header /
+// separator lines, and asserts each data row's ANSI-stripped width
+// equals 122 and starts with the ID at column 0 followed by the status
+// icon at the expected offset.
+func TestActiveStep_ColumnsAreAligned(t *testing.T) {
+	step := newActiveStep([]ipcForward{
+		{ID: "fwd_0001", Kubeconfig: "prod-config", Namespace: "default", Kind: "Service", Object: "noahee-global-noaheepro", Bind: "0.0.0.0", Ports: "8380:8380", Status: "ready", StartedAt: "2026-07-28T10:00:00Z"},
+		{ID: "fwd_0003", Kubeconfig: "prod-config", Namespace: "nodhee", Kind: "Service", Object: "frontend", Bind: "0.0.0.0", Ports: "80:80,443:443,8040:8040,", Status: "starting", StartedAt: "2026-07-28T10:00:00Z"},
+	})
+	v := step.View()
+
+	lines := strings.Split(v, "\n")
+	// Layout in View(): title (with bottom padding = 1 blank line),
+	// header row, ─── separator, data rows. Strip title padding and
+	// pick out the data rows by looking for "fwd_000…".
+	var dataRows []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "fwd_000") {
+			dataRows = append(dataRows, line)
+		}
+	}
+	if len(dataRows) != 2 {
+		t.Fatalf("expected 2 data rows (one per forward), got %d\nfull view:\n%s",
+			len(dataRows), v)
+	}
+
+	const wantRowWidth = 122
+	for i, line := range dataRows {
+		got := lipgloss.Width(line)
+		if got != wantRowWidth {
+			t.Errorf("row %d ANSI-stripped visual width = %d, want %d\nfull row: %q\nfull view:\n%s",
+				i, got, wantRowWidth, line, v)
+		}
+		// The status icon (● for ready, ◐ for starting) should appear
+		// at column 10 — the 9-wide ID cell padded to 9 chars plus
+		// one space separator — followed by "ready" / "starting".
+		wantIconAt := " ● "
+		wantStartingAt := " ◐ "
+		if !strings.Contains(line, wantIconAt) && !strings.Contains(line, wantStartingAt) {
+			t.Errorf("row %d should contain status icon around column 10, got: %q", i, line)
+		}
 	}
 }

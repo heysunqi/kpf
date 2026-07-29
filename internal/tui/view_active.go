@@ -13,56 +13,58 @@ import (
 //
 // Renders 8 columns: ID, STATUS, KIND/OBJECT, NS, BIND, PORTS, CLUSTER, AGE.
 // Designed for terminals ≥120 wide; on narrower widths the rightmost columns
-// (CLUSTER, AGE) get truncated by the table widget's column-width clamping.
+// (CLUSTER, AGE) get truncated visually by the lipgloss styled output.
+//
+// Implementation note: we previously handed colored ANSI cells to
+// bubbles/table's renderer. bubbles/table uses
+// `runewidth.Truncate(value, colWidth, "…")` (from mattn/go-runewidth),
+// which counts raw bytes — including ANSI escape codes — so an "● ready"
+// cell painted with `\x1b[32m…\x1b[0m` got its escapes counted as content
+// and the visible text was chopped at the wrong offset, shifting every
+// subsequent column by several cells. We now render the table ourselves
+// and only use the bubbles/table model for cursor state + key dispatch.
 //
 // The forwards slice is retained alongside the table so d/x/delete hotkeys
 // can map the current cursor index back to a forward id and emit a
-// StopForwardMsg. The table's SelectedRow() returns the rendered cell
-// strings, not the original ipcForward — keeping our own copy avoids
-// re-fetching via the cursor.
+// StopForwardMsg.
 type activeStep struct {
-	table    table.Model
-	forwards []ipcForward // indexed parallel to table rows
-	title    string       // pre-rendered header line ("Active forwards (N) · M ports")
+	table    table.Model // cursor + key navigation only; View() is ours.
+	forwards []ipcForward
+	title    string
+	height   int // body rows visible; updated on WindowSizeMsg
 }
 
-// activeColumnWidths are the visible widths (in monospace cells) for each
-// table column. The bubbles/table widget pads each cell with 2 chars by
-// default; we override the Cell style below to use Padding(0, 0) so the
-// Width values here match the rendered width exactly. Total: 9+12+22+11+
-// 11+24+16+10 = 115 — fits a 120-col terminal; on narrower widths the
-// rightmost columns overflow but the data is still readable.
+// Column widths. These match the visible cell widths exactly because we
+// control padding via celled() (truncate-then-pad with plain spaces).
+// Total: 9+12+22+11+11+24+16+10 = 115, plus 7 single-space separators.
 var activeColumnWidths = []int{9, 12, 22, 11, 11, 24, 16, 10}
+var activeColumnTitles = []string{"ID", "STATUS", "KIND/OBJECT", "NS", "BIND", "PORTS", "CLUSTER", "AGE"}
 
 func newActiveStep(forwards []ipcForward) activeStep {
+	// We keep a bubbles/table instance around for cursor state and key
+	// dispatch (its Update handler does up/down/page-up/page-down/home/end
+	// correctly and reports Cursor() for our d/x/delete mapping). What
+	// we DON'T do is call its View() — see the comment on activeStep.
 	cols := make([]table.Column, 0, len(activeColumnTitles))
-	for i, title := range activeColumnTitles {
-		cols = append(cols, table.Column{Title: title, Width: activeColumnWidths[i]})
+	for i, t := range activeColumnTitles {
+		cols = append(cols, table.Column{Title: t, Width: activeColumnWidths[i]})
 	}
-
 	rows := make([]table.Row, 0, len(forwards))
-	portCount := 0
 	for _, f := range forwards {
-		rows = append(rows, buildActiveRow(f))
-		if f.Ports != "" {
-			portCount += strings.Count(f.Ports, ",") + 1
-		}
+		rows = append(rows, table.Row{f.ID, activePlainStatus(f.Status)})
 	}
-
 	t := table.New(
 		table.WithColumns(cols),
 		table.WithRows(rows),
 		table.WithFocused(true),
-		table.WithStyles(activeTableStyles()),
 	)
-
-	// Title is rendered manually (the v1.0.0 Model has no Title field).
-	// Carries both forward count and total port count so a leak (forwards
-	// (2) · 3 ports but only 2 listeners) is visible at a glance. The
-	// daemon-side parity check (`kpf doctor`) is authoritative; this is
-	// just a surface-level signal.
+	portCount := 0
+	for _, f := range forwards {
+		if f.Ports != "" {
+			portCount += strings.Count(f.Ports, ",") + 1
+		}
+	}
 	title := fmt.Sprintf(" Active forwards (%d) · %d ports ", len(forwards), portCount)
-
 	return activeStep{
 		table:    t,
 		forwards: append([]ipcForward(nil), forwards...),
@@ -70,77 +72,47 @@ func newActiveStep(forwards []ipcForward) activeStep {
 	}
 }
 
-var activeColumnTitles = []string{"ID", "STATUS", "KIND/OBJECT", "NS", "BIND", "PORTS", "CLUSTER", "AGE"}
-
-func buildActiveRow(f ipcForward) table.Row {
-	status := activeStatusCell(f.Status)
-	return table.Row{
-		f.ID,
-		status,
-		truncateCell(f.Kind+"/"+f.Object, activeColumnWidths[2]),
-		truncateCell(f.Namespace, activeColumnWidths[3]),
-		truncateCell(f.Bind, activeColumnWidths[4]),
-		truncateCell(f.Ports, activeColumnWidths[5]),
-		truncateCell(f.Kubeconfig, activeColumnWidths[6]),
-		truncateCell(f.StartedAt, activeColumnWidths[7]),
-	}
-}
-
-// activeStatusCell renders a status string with the same icon + color
-// scheme as the previous list delegate (kept so muscle memory carries over)
-// and returns it as a plain string with embedded ANSI escapes. The table
-// widget treats each cell as a single line of text; ANSI escapes are
-// transparent to its width math via lipgloss.Width.
-func activeStatusCell(status string) string {
+// activePlainStatus returns the icon + word form of the status (no ANSI).
+// bubbles/table only stores this string as a Cursor-tracking hint — it is
+// never rendered by us, because doing so would re-introduce the
+// ANSI-vs-runewidth corruption.
+func activePlainStatus(status string) string {
 	switch status {
 	case "ready":
-		return StatusOK.Render("● " + status)
+		return "● ready"
 	case "starting":
-		return StatusWarn.Render("◐ " + status)
+		return "◐ starting"
 	case "dropped", "reconnecting":
-		return StatusWarn.Render("⚠ " + status)
+		return "⚠ " + status
 	case "stopped":
-		return StatusErr.Render("○ " + status)
+		return "○ stopped"
 	case "stale":
-		return StatusErr.Render("✗ " + status)
+		return "✗ stale"
 	case "error":
-		return StatusErr.Render("! " + status)
+		return "! error"
 	}
 	return status
 }
 
-// truncateCell shortens s to max visual cells. Used to keep long namespace
-// names or multi-pair port lists from blowing out the column layout. The
-// result has ellipsis appended if truncation happened.
-func truncateCell(s string, max int) string {
-	if max <= 0 {
-		return ""
+// activeStatusParts returns the icon-word label and the matching style for
+// the status string. Used by our own View() where we can safely render
+// styled ANSI bytes because we control the cell width math directly.
+func activeStatusParts(status string) (string, lipgloss.Style) {
+	switch status {
+	case "ready":
+		return "● ready", StatusOK
+	case "starting":
+		return "◐ starting", StatusWarn
+	case "dropped", "reconnecting":
+		return "⚠ " + status, StatusWarn
+	case "stopped":
+		return "○ stopped", StatusErr
+	case "stale":
+		return "✗ stale", StatusErr
+	case "error":
+		return "! error", StatusErr
 	}
-	if lipgloss.Width(s) <= max {
-		return s
-	}
-	if max <= 1 {
-		return "…"
-	}
-	// lipgloss has a Truncate helper that handles ANSI correctly; use it.
-	return lipgloss.NewStyle().MaxWidth(max).Render(s)
-}
-
-func activeTableStyles() table.Styles {
-	s := table.DefaultStyles()
-	s.Header = s.Header.
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(muted).
-		BorderBottom(true).
-		Bold(true)
-	// Drop the default (0, 1) cell padding so column Width values match
-	// the rendered width exactly — see the comment on activeColumnWidths.
-	s.Cell = s.Cell.Padding(0, 0)
-	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(accent).
-		Bold(true)
-	return s
+	return status, lipgloss.NewStyle()
 }
 
 func (a activeStep) Init() tea.Cmd { return nil }
@@ -148,17 +120,14 @@ func (a activeStep) Init() tea.Cmd { return nil }
 func (a activeStep) Update(msg tea.Msg) (activeStep, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Leave 4 cols of horizontal margin and 1 row for the title and 1 for
-		// the footer. The bubbles/table implementation clamps widths to its
-		// configured column Widths regardless of container width, so a narrow
-		// terminal ends up with horizontal overflow rather than truncation —
-		// acceptable for now since the wizard itself demands ≥80 cols.
+		// Body height = total - title(1) - header(1) - separator(1) - footer(1)
+		// and Body in app.go applies another -2 for its padding, so use
+		// the same -6 the previous bubbles/table-based version used.
 		h := msg.Height - 6
 		if h < 3 {
 			h = 3
 		}
-		a.table.SetWidth(msg.Width - 4)
-		a.table.SetHeight(h)
+		a.height = h
 		return a, nil
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -179,5 +148,101 @@ func (a activeStep) Update(msg tea.Msg) (activeStep, tea.Cmd) {
 }
 
 func (a activeStep) View() string {
-	return ListTitle.Render(a.title) + "\n" + a.table.View()
+	title := ListTitle.Render(a.title)
+	headerLine := renderActiveHeader()
+	sep := strings.Repeat("─", activeTotalRowWidth())
+
+	cursor := a.table.Cursor()
+	rowLines := make([]string, 0, len(a.forwards))
+	for i, f := range a.forwards {
+		line := renderActiveRow(f)
+		if i == cursor {
+			line = activeSelectedRowStyle.Render(line)
+		}
+		rowLines = append(rowLines, line)
+	}
+	if a.height > 0 && len(rowLines) > a.height {
+		rowLines = rowLines[:a.height]
+	}
+
+	body := strings.Join(rowLines, "\n")
+	if body == "" {
+		body = "(no active forwards)"
+	}
+
+	return title + "\n" + headerLine + "\n" + sep + "\n" + body
+}
+
+// activeTotalRowWidth is the visible width of a fully-populated row, equal
+// to the sum of column widths plus the single-space separators between
+// the 8 cells.
+func activeTotalRowWidth() int {
+	w := 0
+	for _, cw := range activeColumnWidths {
+		w += cw
+	}
+	w += len(activeColumnWidths) - 1
+	return w
+}
+
+func renderActiveHeader() string {
+	parts := make([]string, len(activeColumnTitles))
+	for i, t := range activeColumnTitles {
+		parts[i] = celled(t, activeColumnWidths[i])
+	}
+	return activeHeaderStyle.Render(strings.Join(parts, " "))
+}
+
+func renderActiveRow(f ipcForward) string {
+	parts := []string{
+		celled(f.ID, activeColumnWidths[0]),
+		renderActiveStatus(f.Status),
+		celled(f.Kind+"/"+f.Object, activeColumnWidths[2]),
+		celled(f.Namespace, activeColumnWidths[3]),
+		celled(f.Bind, activeColumnWidths[4]),
+		celled(f.Ports, activeColumnWidths[5]),
+		celled(f.Kubeconfig, activeColumnWidths[6]),
+		celled(f.StartedAt, activeColumnWidths[7]),
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderActiveStatus(s string) string {
+	label, style := activeStatusParts(s)
+	return style.Render(celled(label, activeColumnWidths[1]))
+}
+
+// truncateCell shortens s to at most w visible cells (ANSI-safe via
+// lipgloss.MaxWidth). Used by buildKubeRow in step_kubeconfig.go and
+// elsewhere where plain truncation is enough and the call site is
+// responsible for any padding. celled below wraps truncateCell plus
+// trailing-space padding — use that for column-fixed layouts.
+func truncateCell(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w <= 1 {
+		return "…"
+	}
+	return lipgloss.NewStyle().MaxWidth(w).Render(s)
+}
+
+// celled truncates s to at most w visible cells (lipgloss ANSI-aware)
+// and then pads it with trailing spaces to exactly w cells. Truncation
+// uses lipgloss.MaxWidth which handles ANSI escapes correctly so this
+// helper is safe to use either before or after applying a status color.
+func celled(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) > w {
+		s = truncateCell(s, w)
+	}
+	if pad := w - lipgloss.Width(s); pad > 0 {
+		s += strings.Repeat(" ", pad)
+	}
+	return s
 }

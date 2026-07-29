@@ -85,12 +85,14 @@ var (
 	StatusWarn = lipgloss.NewStyle().
 			Foreground(warning)
 
-	// Active view table
-	TableHeader = lipgloss.NewStyle().
-			Bold(true).
-			Underline(true).
-			Padding(0, 1)
-
-	TableCell = lipgloss.NewStyle().
-			Padding(0, 1)
+	// Active view table — these styles are applied by renderActiveHeader /
+	// renderActiveRow in view_active.go. The header is plain bold text
+	// (no border, no background) so the separator rule below it provides
+	// the visual demarcation; the cursor row gets a colored background
+	// to make the selection unmistakable across the long row.
+	activeHeaderStyle = lipgloss.NewStyle().Bold(true)
+	activeSelectedRowStyle = lipgloss.NewStyle().
+				Foreground(white).
+				Background(accent).
+				Bold(true)
 )
