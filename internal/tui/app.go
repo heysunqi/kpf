@@ -159,6 +159,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.step = stepQuitting
 			m.bridge.close()
 			return m, tea.Quit
+		case "q":
+			// Global quit. bubbles/list ships with q→Quit by default so
+			// namespace / resource / object steps happened to work
+			// before; the table-based kubeconfig + active steps don't,
+			// so handle it here so the footer's "q quit" promise holds
+			// across all steps.
+			m.step = stepQuitting
+			m.bridge.close()
+			return m, tea.Quit
 		case "esc":
 			if m.step == stepActive {
 				m.step = stepKubeconfig

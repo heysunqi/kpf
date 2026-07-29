@@ -45,6 +45,38 @@ func TestApp_QuitOnCtrlC(t *testing.T) {
 	}
 }
 
+// TestApp_QuitOnQ locks in global q→Quit behavior. bubbles/list has q
+// bound to tea.Quit by default, so the namespace / resource / object
+// steps (still list-based) inherited it. After switching kubeconfig to
+// bubbles/table and active to a custom renderer, those steps lost the
+// binding. The fix in app.go's KeyMsg switch restores it globally so
+// the footer's "q quit" promise holds across every step.
+func TestApp_QuitOnQ(t *testing.T) {
+	cases := []struct {
+		name string
+		step step
+	}{
+		{"kubeconfig (table-based)", stepKubeconfig},
+		{"active (custom renderer)", stepActive},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New("")
+			m.width = 120
+			m.height = 40
+			m.step = tc.step
+			m2, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+			if cmd == nil {
+				t.Fatal("expected q to produce a tea.Quit command")
+			}
+			m = m2.(Model)
+			if m.step != stepQuitting {
+				t.Errorf("step = %v, want stepQuitting", m.step)
+			}
+		})
+	}
+}
+
 func TestApp_KubeToNsTransition(t *testing.T) {
 	m := New("")
 	m.width = 120
