@@ -73,6 +73,13 @@ var (
 			Bold(true).
 			Padding(0, 2)
 
+	// MutedText is a bare style with the muted foreground — used to
+	// de-emphasize excluded port rows in the right pane (they're not
+	// in the submit payload, so they shouldn't visually compete with
+	// the included rows).
+	MutedText = lipgloss.NewStyle().
+			Foreground(muted)
+
 	// Status
 	StatusOK = lipgloss.NewStyle().
 			Foreground(success).

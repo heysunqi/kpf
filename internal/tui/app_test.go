@@ -335,6 +335,12 @@ func TestApp_EnterPassesAtStepPortWhenNotStarting(t *testing.T) {
 	if m.starting {
 		t.Fatalf("setup: m.starting should be false")
 	}
+	// Under the new whitelist UX (all ports excluded by default), the
+	// user must press space to opt the port into the submit payload
+	// before Enter will produce PortMapReadyMsg. This mirrors the
+	// real-world flow.
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	m = m2.(Model)
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("Enter at stepPort when not starting should produce a cmd (PortMapReadyMsg)")
@@ -426,11 +432,16 @@ func TestApp_StopForwardFailureSurfacesError(t *testing.T) {
 	}
 }
 
-// TestApp_PortStep_PreFlightConflict verifies that when the user enters a
-// local port that's already bound (e.g. by a previous forward), the port
+// TestApp_PortStep_PreFlightConflict verifies that when the user includes
+// a local port that's already bound (e.g. by a previous forward), the port
 // step (a) shows a conflict marker in the right pane and (b) refuses to
 // submit — pressing Enter returns nil cmd instead of PortMapReadyMsg.
 // This was previously only caught after an IPC roundtrip to the daemon.
+//
+// Under the whitelist UX, ports are excluded by default — so this test
+// must explicitly include the conflicting port (cursor 1, "down" + " ")
+// to exercise the pre-flight path. Excluded ports skip pre-flight entirely,
+// which is the bug-fix the original screenshot was about.
 func TestApp_PortStep_PreFlightConflict(t *testing.T) {
 	m := New("")
 	m.width = 120
@@ -460,7 +471,15 @@ func TestApp_PortStep_PreFlightConflict(t *testing.T) {
 	if m.step != stepPort {
 		t.Fatalf("setup: step = %v, want stepPort", m.step)
 	}
-	// View should already mark the conflicting port.
+	// Include the conflicting port (cursor 1) — default state is
+	// both excluded, so without this the pre-flight path isn't
+	// exercised. KeyDown navigates the list; " " toggles inclusion.
+	// We send navigation keys to the list directly to bypass the
+	// focused textinput (which would otherwise consume KeyDown).
+	m.port.list, _ = m.port.list.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	m = m2.(Model)
+	// View should now mark the conflicting port.
 	v := m.View()
 	if !strings.Contains(v, "in use") {
 		t.Errorf("expected pre-flight conflict marker in view, got:\n%s", v)

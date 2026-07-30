@@ -48,6 +48,15 @@ func TestApp_PortStepView(t *testing.T) {
 	if !strings.Contains(v, "Local ports") {
 		t.Errorf("port step view missing 'Local ports' label")
 	}
+	// Whitelist UX: ports default to excluded, so the checkbox glyph
+	// must be [ ] (not [x]) for every row. The exact textinput value
+	// may also be present (e.g. "> 8080"), so substring match is fine.
+	if strings.Contains(v, "[x]") {
+		t.Errorf("port step should default to [ ] checkboxes (excluded), found [x]")
+	}
+	if !strings.Contains(v, "[ ]") {
+		t.Errorf("port step view missing '[ ]' checkbox glyph for default-excluded rows")
+	}
 
 	// Render output preview
 	t.Logf("\n=== Port step preview (width=100, height=30) ===\n%s", v)
