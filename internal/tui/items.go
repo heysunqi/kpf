@@ -27,6 +27,19 @@ func NewDefaultDelegate() *list.DefaultDelegate {
 	return &d
 }
 
+// NewTitleOnlyDelegate returns a styled default delegate with the
+// description line suppressed. Use this when the right pane or a
+// help line already communicates the secondary information — keeping
+// each row to one line lets more items fit in the viewport, which
+// matters most for the port step where a single Pod can expose
+// 4-8 ports and the user needs to see all of them at once to pick
+// which subset to forward.
+func NewTitleOnlyDelegate() *list.DefaultDelegate {
+	d := NewDefaultDelegate()
+	d.ShowDescription = false
+	return d
+}
+
 // nsItem implements list.Item for a namespace.
 type nsItem struct {
 	name    string

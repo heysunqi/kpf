@@ -77,12 +77,19 @@ func newPortStep(remotePorts []int, bind string) portStep {
 		items = append(items, portPairItem{p: p, selected: false})
 		excluded[i] = true
 	}
-	l := list.New(items, NewDefaultDelegate(), 0, 0)
+	// Title-only delegate (no description line) — the "space to
+	// include/exclude" hint lives in the right pane help line and the
+	// footer, so we don't need to repeat it under each row. Halving
+	// the per-row height lets all 4 (or more) Pod ports fit on screen
+	// without scrolling, which matters when the user is picking a
+	// subset to forward.
+	l := list.New(items, NewTitleOnlyDelegate(), 0, 0)
 	l.Title = "Configure port mapping"
 	l.SetShowStatusBar(false)
+	l.SetShowPagination(false) // 4-8 ports always fit on one page now
 	l.SetFilteringEnabled(false)
 	l.Styles.Title = ListTitle
-	l.SetSize(40, 12)
+	l.SetSize(40, 20)
 
 	inputs := make([]textinput.Model, len(pairs))
 	for i, p := range pairs {
