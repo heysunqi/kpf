@@ -136,4 +136,7 @@ jobs:
             dist/kpf-${{ github.ref_name }}-SHASUMS256.txt
           fail_on_unmatched_files: true
           # Replaces assets of the same name on rerun (idempotent reruns).
-          replace_assets: true
+          # `replace_assets` was renamed to `overwrite_files` in
+          # softprops/action-gh-release@v2; old name still works but
+          # emits a deprecation warning on every run.
+          overwrite_files: true
