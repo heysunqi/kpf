@@ -30,7 +30,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 // hiddenArg is the second argv value the parent process passes when
 // re-executing itself to run as the actual daemon.

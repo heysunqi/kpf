@@ -29,14 +29,14 @@
 
 - **五种资源类型**：Pod、Service、Deployment、StatefulSet、ReplicaSet。
 - **自动解析 backing pod**：高阶资源（Service / Deployment / STS / RS）无需手动指定 Pod，按 ready + creationTimestamp 选最优。
-- **多端口转发**：列出对象的所有 remote 端口（容器端口或 Service port），用户可以把每个 remote 映射到任意 local 端口；想要排除某个端口可以改成不会被路由到的本地端口（实际场景：forward 全部 remote 端口，客户端连不上也无所谓）。
+- **多端口转发**：列出对象的所有 remote 端口（容器端口或 Service port），用户可以**逐端口勾选**哪些纳入转发（默认全部未勾，按 `space` 切换）。例如 Pod 暴露 80/443/8040/8050 四个端口、只想转发其中一个时，不需要再去映射到不会被路由的端口，直接 `space` 选 / 不选即可。`local` 端口默认等于 `remote`，可逐行编辑成任意可用端口；`enter` 提交后只把勾选的 pair 装进 submit payload。
 - **绑定地址**：`0.0.0.0` 默认（局域网可达），`127.0.0.1` 收紧到本机。
 
 ### 稳定性
 
 - **自动重连**：完整抖动指数退避（base 500ms，cap 30s），连接断开后无限次重试。
 - **Stale 终结**：连续 3 次 `pod not found` 自动把 forward 标记为 `stale` 并停止重试，避免无效打日志。
-- **端口冲突检测**：转发启动前 `tryListen` 探测本地端口，命中直接返回 `port_in_use`，错误信息保留原 cause。daemon 还扫描 manager 里所有已注册 forward 的 `spec.Ports`，对**已经声明但还没 bind 到内核**的端口（处于 SPDY dial 阶段）也一并拒绝——避免两次提交都被 OS 级 `tryListen` 漏判的竞态。TUI 在第 ⑤ 步还会做一次**双源预检**：本地 `bind() + close()` 探测 + 通过 `forward.claimedPorts` IPC 拉 daemon 的权威声明表，命中任何一个就在输入框右侧出现 `✗ in use` 红色提示；按 Enter 时若仍有冲突则直接拦下并提示哪个端口冲突（含持有该端口的 forward id），省掉 IPC 往返。Forward goroutine 的 `runOnce` 也补了一个 `pfErrCh` 分支——bind 失败不会再卡在 `starting` 状态。
+- **端口冲突检测**：转发启动前 `tryListen` 探测本地端口，命中直接返回 `port_in_use`，错误信息保留原 cause。daemon 还扫描 manager 里所有已注册 forward 的 `spec.Ports`，对**已经声明但还没 bind 到内核**的端口（处于 SPDY dial 阶段）也一并拒绝——避免两次提交都被 OS 级 `tryListen` 漏判的竞态。TUI 在第 ⑤ 步还会做一次**双源预检**：本地 `bind() + close()` 探测 + 通过 `forward.claimedPorts` IPC 拉 daemon 的权威声明表，命中任何一个就在输入框右侧出现 `✗ in use` 红色提示；按 Enter 时若仍有冲突则直接拦下并提示哪个端口冲突（含持有该端口的 forward id），省掉 IPC 往返。**未勾选的端口跳过预检**——白名单 UX 核心：用户只想转发 Pod 4 个端口中的 8050 时，80/443/8040 的"in use"状态永远不阻塞提交。Forward goroutine 的 `runOnce` 也补了一个 `pfErrCh` 分支——bind 失败不会再卡在 `starting` 状态。
 - **监听器泄漏防护**：`shutdown()` 显式调用 `pf.Close()`，并在重试循环中关闭旧实例，杜绝僵尸 socket。
 - **三层保活**：Forward 进入 Ready 后启动 `runHealthCheck` goroutine，每 `probeInterval = 5s` 对每个本地端口做一次 `net.DialTimeout(2s)`；kernel 拒绝 → `pf.Close()` → `ForwardPorts()` 经 `CloseChan` 退出 → Run 走 backoff 重连。这是应用层兜底，**不依赖** SPDY ping / TCP keepalive 是否被沿途 NAT 吃掉。三层叠加：client-go 内置 SPDY ping (5s) + kpf 主动探针 (5s) + 用户请求触发。详见 `internal/forward/forwarder.go` 的 `runHealthCheck` / `probeLocalPorts`。
 - **状态原子持久化**：`state.json` 通过 temp + rename + fsync 写入，永不出现半截文件。
@@ -56,7 +56,7 @@
 
 ### 交互体验
 
-- **5 步向导 TUI**：kubeconfig → namespace → 资源类型 → 对象 → 端口。**kubeconfig** 用 `bubbles/table` 列展示（信息密度高）；**namespace / resource / object** 仍用 list 列表，保留 `/` 过滤；**端口**用 textinput。`↑/↓` 选择，`enter` 确认，`esc` 回退。
+- **5 步向导 TUI**：kubeconfig → namespace → 资源类型 → 对象 → 端口。**kubeconfig** 用 `bubbles/table` 列展示（信息密度高）；**namespace / resource / object** 仍用 list 列表，保留 `/` 过滤；**端口**用 list（左侧带 checkbox，可选）+ textinput（右侧编辑 local 端口）。`↑/↓` 选择，`enter` 确认，`esc` 回退，`space` 在端口步切换勾选状态。
 - **Active 视图**：所有正在运行的 forward **8 列表格**展示（ID / STATUS / KIND/OBJECT / NS / BIND / PORTS / CLUSTER / AGE），自动 1.5s tick + 事件订阅双驱动刷新，状态色块化（● ready / ◐ starting / ⚠ dropped / ○ stopped / ✗ stale）。光标定位选中行，`d` / `x` / `delete` 通过 Cursor 索引回 forward id 后停止。
 - **Active 视图快捷键**：`d` / `x` / `delete` 一键停止选中 forward；删除结果实时回显到状态行。
 - **Loading 状态**：第 ⑤ 步按 Enter 后渲染转圈 spinner，并禁用再次按 Enter，防止 k8s dial 慢时连按导致重复 forward（多个 starting 卡死）。
@@ -300,13 +300,17 @@ watch 模式下默认清屏 + 光标归位；JSON 模式下不刷屏，每行一
 | 按键             | 作用                                       |
 | ---------------- | ------------------------------------------ |
 | `↑` / `↓`        | 上下移动                                   |
-| `enter`          | 确认当前步骤                               |
+| `enter`          | 确认当前步骤（端口步：提交勾选的 pair）    |
 | `esc`            | 回退一步                                   |
 | `/`              | 过滤列表                                   |
+| `space`          | 端口步：切换当前行的勾选状态               |
+| `tab` / `shift+tab` | 端口步：循环切换正在编辑的 local 端口输入框 |
 | `a`              | 跳到 Active 视图                           |
 | `d` / `x` / `delete` | 在 Active 视图：停止选中 forward        |
 | `q`              | 退出 TUI（daemon 与 forward 继续运行）     |
 | `ctrl+c`         | 立即退出                                   |
+
+第 ⑤ 步是**多选 + 编辑**的复合视图：左侧 list 用 `space` 在 `[ ]` / `[x]` 之间切换（**默认全部 `[ ]`**，用户主动勾选才会转发）；右侧对应每行的 `local` 端口 textinput，`tab` / `shift+tab` 在输入框之间循环，`enter` 提交时会**只装被勾选的 pair** 进 payload。全未勾选时提交会被拦下并提示 `no ports selected — press space to include at least one`，避免 daemon 因空 spec 拒收。
 
 第 ⑤ 步按 `enter` 后会显示 `⟳ starting forward…` 转圈，**此时再按 Enter 被吞掉**，防止 k8s dial 慢时连按生成重复 forward。
 
