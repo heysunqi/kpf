@@ -77,6 +77,8 @@ jobs:
 
       - name: Locate artifact
         id: locate
+        env:
+          VERSION: ${{ github.ref_name }}   # e.g. v0.1.1
         run: |
           VER="${VERSION#v}"
           echo "path=dist/kpf-${VER}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
@@ -94,6 +96,13 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      # github.ref_name is 'v0.1.2'; build-release.sh writes files
+      # with the 'v' stripped, so do the same here. split('v0.1.2','v')
+      # yields ['', '0.1.2']; index [1] is the stripped form.
+      # All steps below reference ${{ env.VER_NO_V }} so the version
+      # doesn't drift between SHASUMS and the release upload.
+      VER_NO_V: ${{ split(github.ref_name, 'v')[1] }}
     steps:
       - uses: actions/checkout@v5
 
@@ -111,12 +120,9 @@ jobs:
         run: ls -lh dist/
 
       - name: Generate SHASUMS256.txt
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
-          VER="${VERSION#v}"
-          ( cd dist && shasum -a 256 kpf-${VER}-*.tar.gz > kpf-${VER}-SHASUMS256.txt )
-          cat dist/kpf-${VER}-SHASUMS256.txt
+          ( cd dist && shasum -a 256 kpf-${VER_NO_V}-*.tar.gz > kpf-${VER_NO_V}-SHASUMS256.txt )
+          cat dist/kpf-${VER_NO_V}-SHASUMS256.txt
 
       # softprops/action-gh-release:
       #   - creates the release if it doesn't exist (matching the tag)
@@ -131,11 +137,11 @@ jobs:
           name: kpf ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            dist/kpf-${{ github.ref_name }}-linux-amd64.tar.gz
-            dist/kpf-${{ github.ref_name }}-linux-arm64.tar.gz
-            dist/kpf-${{ github.ref_name }}-darwin-amd64.tar.gz
-            dist/kpf-${{ github.ref_name }}-darwin-arm64.tar.gz
-            dist/kpf-${{ github.ref_name }}-SHASUMS256.txt
+            dist/kpf-${{ env.VER_NO_V }}-linux-amd64.tar.gz
+            dist/kpf-${{ env.VER_NO_V }}-linux-arm64.tar.gz
+            dist/kpf-${{ env.VER_NO_V }}-darwin-amd64.tar.gz
+            dist/kpf-${{ env.VER_NO_V }}-darwin-arm64.tar.gz
+            dist/kpf-${{ env.VER_NO_V }}-SHASUMS256.txt
           fail_on_unmatched_files: true
           # Replaces assets of the same name on rerun (idempotent reruns).
           replace_assets: true
